@@ -1855,6 +1855,55 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
+#if defined(TM_TITLE_BCES01010)
+/* ---------------------------------------------------------------------------
+ * The title's command-buffer flush, guest 0x0077DEC0 (BCES01010): a sync, then
+ * put = offset of ctx->current. Nothing else in its frame loop waits for the
+ * RSX to take that put, because an idle RSX parked at the old put follows it
+ * within microseconds.
+ *
+ * The title runs two ring segments. Each ends, at put, with a JUMP to the other
+ * one; the flush that moves put into the other segment is what releases it, and
+ * right after it the title starts writing the next frame over the segment it
+ * just left. Our walker drains every millisecond or so, and a small boot frame
+ * is written in less: about one run in three it covered the JUMP before the
+ * walker took it, the walker read vertex-program words as commands and ended up
+ * in unmapped IO at 0x0FD00000 (captures/tl-1, 2026-10-16).
+ *
+ * So, when the flush moves put while the walker is parked at the old one, wait
+ * for the walker to leave it, as the RSX would have. The walker's thread also
+ * builds Vulkan pipelines, so it can take tens of milliseconds to get there
+ * when a frame brings new shaders: 5 ms left the boot desync at 5 runs in 12,
+ * 100 ms took it to 0 in 12 with no change in frame rate. Bounded by
+ * TM_FLUSH_SYNC_MS (default 100; 0 turns it off), because with
+ * GCM_SEMA_ACQUIRE=1 the walker can be waiting on a label this very thread
+ * writes later. A walker that is busy elsewhere is not waited for.
+ * ------------------------------------------------------------------------- */
+void func_0077DEC0_lifted(ppu_context* ctx);
+void func_0077DEC0(ppu_context* ctx)
+{
+    const uint32_t old_put = vm_read32(GCM_CONTROL_EA + 0);
+    func_0077DEC0_lifted(ctx);
+    static int ms = -1;
+    if (ms < 0) { const char* e = getenv("TM_FLUSH_SYNC_MS"); ms = e ? atoi(e) : 100; }
+    if (ms <= 0) return;
+    if (vm_read32(GCM_CONTROL_EA + 0) == old_put) return;      /* put did not move */
+    if (vm_read32(GCM_CONTROL_EA + 4) != old_put) return;      /* walker not parked there */
+    struct timespec t0, t; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        if (vm_read32(GCM_CONTROL_EA + 4) != old_put) return;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if ((t.tv_sec - t0.tv_sec) * 1000L + (t.tv_nsec - t0.tv_nsec) / 1000000L >= ms) {
+            static int n = 0;
+            if (n++ < 4) fprintf(stderr, "[tm-flush] walker still at old put 0x%08X after %d ms\n", old_put, ms);
+            return;
+        }
+        struct timespec ts = { 0, 20000 };
+        nanosleep(&ts, nullptr);
+    }
+}
+#endif
+
 /* The Edge decompressor's completion wait, per title: BCUS98106 0x0099790C;
  * BCES01010 0x0099864C, the only caller of cellSpursEventFlagWait in that
  * binary, at the same +0xD40 shift as the logger next to it. */

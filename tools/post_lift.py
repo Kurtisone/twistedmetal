@@ -194,6 +194,7 @@ TITLES = {
                           '004747BC': "the Ui state machine's log (BCUS98106 0x004740EC)",
                           '0099864C': "the Edge decompressor's completion wait (BCUS98106 0x0099790C)",
                           '00976FD4': "the title's dlmalloc free(mspace, mem), checked under TM_FREECHECK",
+                          '0077DEC0': "the title's command-buffer flush (put = ctx->current): waits for the RSX walker to take the new put",
                       },
                       trace={}, fallthrough={}, address_patches=False),
 }
