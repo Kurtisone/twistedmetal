@@ -118,8 +118,51 @@ extern "C" void ps3_hle_register(unsigned int nid, const char* name, void* handl
 extern "C" int32_t cellSpursBarrierInitialize(uint64_t taskset, uint64_t barrier, uint32_t total);
 extern "C" int32_t cellSpursGetTasksetInfo(uint64_t taskset, uint64_t info);
 
+/* ---------------------------------------------------------------------------
+ * TM_NO_MLAA=1: skip the game's SPU MLAA (Edge post, edgepost-mlaa-task).
+ *
+ * Each frame the render thread (func_006588D4) calls func_0065EAC0, which
+ * kicks the MLAA SPURS tasks on the context at 0x01928FE0 (set up by
+ * func_0065E950 through Edge's init, func_00C3E9D8) and waits for their
+ * completion word before the frame is published (label 0x42). Its first
+ * instruction reads one byte, 0x00F5B1D8: 0 makes it return at once. The byte
+ * is 1 in the ELF's data and nothing in the game writes it, so it is a build
+ * option, with MLAA's two parameters (0x40, 0x10) right behind it.
+ *
+ * Off by default: frames come out without antialiasing. It is for test runs,
+ * where the lifted SPU MLAA is the slowest part of a frame, and for telling
+ * MLAA apart from the renderer when an image is wrong.
+ * ------------------------------------------------------------------------- */
+#if defined(TM_TITLE_BCES01010)
+static void tm_apply_no_mlaa(void)
+{
+    const char* e = getenv("TM_NO_MLAA");
+    if (!e || !*e || *e == '0') return;
+    static const char path[] = "e:/packages/RT_BCES01010/RTApp/MLAA.cpp";
+    const uint32_t flag = 0x00F5B1D8u, path_ea = 0x00CD81B8u;
+    for (uint32_t i = 0; i < sizeof path - 1; i++)
+        if (vm_read8(path_ea + i) != (uint8_t)path[i]) {
+            fprintf(stderr, "[tm] TM_NO_MLAA: not the expected executable, left alone\n");
+            return;
+        }
+    if (vm_read8(flag) != 1u) {
+        fprintf(stderr, "[tm] TM_NO_MLAA: MLAA flag at 0x%08X is %u, not 1; left alone\n",
+                flag, vm_read8(flag));
+        return;
+    }
+    vm_write8(flag, 0);
+    fprintf(stderr, "[tm] TM_NO_MLAA: SPU MLAA off (0x%08X = 0)\n", flag);
+}
+#else
+static void tm_apply_no_mlaa(void)
+{
+    if (getenv("TM_NO_MLAA")) fprintf(stderr, "[tm] TM_NO_MLAA: only known for BCES01010\n");
+}
+#endif
+
 extern "C" void tm_hle_register_extra(void)
 {
+    tm_apply_no_mlaa();   /* the ELF is loaded; no guest thread runs yet */
     tm_vdec_register();
     ps3_hle_register_ctx(0xA3E3BE68u, "sys_ppu_thread_once",      sys_ppu_thread_once);
     ps3_hle_register_ctx(0x42B23552u, "sys_prx_register_library", sys_prx_register_library);
