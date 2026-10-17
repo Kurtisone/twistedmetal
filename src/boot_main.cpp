@@ -582,6 +582,8 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #if defined(PS3RECOMP_RSX_VULKAN)
 extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_vulkan_backend_present(void);
+extern "C" void rsx_vulkan_backend_present_begin(void);
+extern "C" void rsx_vulkan_backend_present_finish(void);
 extern "C" int  rsx_vulkan_backend_pump_messages(void);
 #endif
 
@@ -590,6 +592,11 @@ struct TmBackend {
     int  (*init)(uint32_t, uint32_t, const char*);
     void (*present)(void);
     int  (*pump)(void);
+    /* The same present in two halves (rsx_vulkan_backend.h): the first
+     * under the walker lock, the second beside the walker. NULL: present
+     * does it all. */
+    void (*present_begin)(void);
+    void (*present_finish)(void);
 };
 
 static TmBackend tm_pick_backend(void)
@@ -598,10 +605,11 @@ static TmBackend tm_pick_backend(void)
     const char* e = getenv("TM_RSX");
     if (!e || strcmp(e, "null") != 0)
         return { "Vulkan", rsx_vulkan_backend_init, rsx_vulkan_backend_present,
-                 rsx_vulkan_backend_pump_messages };
+                 rsx_vulkan_backend_pump_messages, rsx_vulkan_backend_present_begin,
+                 rsx_vulkan_backend_present_finish };
 #endif
     return { "null", rsx_null_backend_init, rsx_null_backend_present,
-             rsx_null_backend_pump_messages };
+             rsx_null_backend_pump_messages, nullptr, nullptr };
 }
 
 static uint64_t tm_now_ms(void)
@@ -615,6 +623,95 @@ static uint64_t tm_now_ms(void)
  * every wake (~1 ms), 60 Hz ticks caught up in bounded bursts and delivered on
  * the main guest thread (cellGcm_request_tick), present on the game's flip
  * once the FIFO has drained up to put. */
+/* How the RSX side's work is spread over host threads.
+ *
+ * The title moves put into its other ring segment and at once starts writing
+ * its next frame over the segment it left, JUMP out of it included. The RSX
+ * takes that JUMP within microseconds; a walker that is busy elsewhere reads
+ * the new frame's data as commands instead (the boot desync at 0x0FD00000).
+ *
+ * With a backend that presents in two halves (Vulkan), the walker gets a
+ * thread of its own: it drains and delivers the 60 Hz beats, and waits on
+ * cellGcm's kick event rather than a 1 ms sleep, which the title's flush sets
+ * when put moves (func_0077DEC0, hle_extra.cpp). This thread keeps the
+ * window: it pumps it, and presents with only the first half under the
+ * walker lock (s_rsx_mu); the GPU wait, the readback and the window blit run
+ * beside the walker. Boots without the flush wrapper (TM_FLUSH_SYNC_MS=0)
+ * that run the next frame's data: 9 of 12 on one thread, 0 of 36 this way.
+ *
+ * TM_PRESENT_THREAD=0 keeps everything on this thread as before;
+ * TM_FLUSH_KICK=0 brings the 1 ms sleep back. */
+extern "C" void cellGcm_fifo_kick_wait(unsigned ms);
+static pthread_mutex_t s_rsx_mu = PTHREAD_MUTEX_INITIALIZER;
+static int tm_env_int(const char* name, int def) { const char* e = getenv(name); return e ? atoi(e) : def; }
+static int s_flush_kick;   /* read by hle_extra.cpp's flush wrapper */
+extern "C" int tm_flush_kick_on(void) { return s_flush_kick; }
+
+struct TmRsxLock {
+    bool on;
+    explicit TmRsxLock(bool o) : on(o) { if (on) pthread_mutex_lock(&s_rsx_mu); }
+    ~TmRsxLock() { if (on) pthread_mutex_unlock(&s_rsx_mu); }
+};
+
+static void tm_walker_wait(void)
+{
+    if (s_flush_kick) { cellGcm_fifo_kick_wait(1); return; }
+    const struct timespec one_ms = {0, 1000000};
+    nanosleep(&one_ms, NULL);
+}
+
+static void tm_drain(int rsx_ok, bool locked)
+{
+    if (!rsx_ok) return;
+    TmRsxLock l(locked);
+    cellGcm_rsx_process_fifo();
+}
+
+/* Drain, title probes, then the 60 Hz beats caught up in bounded bursts. */
+static void tm_walker_step(int rsx_ok, bool locked, uint64_t* next_tick)
+{
+    tm_drain(rsx_ok, locked);
+    tm_fbdump_tick();
+    tm_ef_kick_tick();
+    tm_loaddone_tick();
+    tm_fifowatch_tick();
+    tm_memdump_tick();
+    const uint64_t now = tm_now_ms();
+    int fired = 0;
+    while ((int64_t)(now - *next_tick) >= 0 && fired < 240) {
+        cellGcm_request_tick();
+        tm_drain(rsx_ok, locked);
+        *next_tick += 16;
+        fired++;
+    }
+    if (fired >= 240) *next_tick = now;
+}
+
+/* With `split`, only the half that reads the flipped surface holds the
+ * walker lock. */
+static void tm_present_if_flipped(const TmBackend& be, bool split)
+{
+    {
+        TmRsxLock l(split);
+        if (!cellGcm_take_flip_pending_synced()) return;
+        if (split) be.present_begin();
+        else       be.present();
+    }
+    if (split) be.present_finish();
+    tm_count_presented_frame();
+}
+
+static volatile int s_walker_rsx_ok;
+static void* tm_walker_thread(void*)
+{
+    uint64_t next_tick = tm_now_ms();
+    for (;;) {
+        tm_walker_wait();
+        tm_walker_step(s_walker_rsx_ok, true, &next_tick);
+    }
+    return nullptr;
+}
+
 static void* tm_frame_clock(void*)
 {
     uint32_t rsx_w = 1280, rsx_h = 704;
@@ -623,32 +720,34 @@ static void* tm_frame_clock(void*)
     const TmBackend be = tm_pick_backend();
     int rsx_ok = (be.init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", be.name, rsx_ok ? "OK" : "FAILED");
+    const bool split = be.present_begin && be.present_finish && tm_env_int("TM_PRESENT_THREAD", 1);
+    s_flush_kick = tm_env_int("TM_FLUSH_KICK", split ? 1 : 0);
+
+    if (split) {
+        s_walker_rsx_ok = rsx_ok;
+        pthread_t t;
+        if (pthread_create(&t, nullptr, tm_walker_thread, nullptr) == 0) {
+            pthread_detach(t);
+            fprintf(stderr, "[rsx] walker on its own thread, present beside it (flush kick %d)\n",
+                    s_flush_kick);
+            for (;;) {
+                const struct timespec one_ms = {0, 1000000};
+                nanosleep(&one_ms, NULL);
+                if (!rsx_ok) continue;
+                if (be.pump() != 0) { rsx_ok = 0; s_walker_rsx_ok = 0; continue; }
+                tm_present_if_flipped(be, true);
+            }
+        }
+        fprintf(stderr, "[rsx] walker thread not started; presenting on this thread\n");
+    }
 
     uint64_t next_tick = tm_now_ms();
     for (;;) {
-        const struct timespec one_ms = {0, 1000000};
-        nanosleep(&one_ms, NULL);
-        if (rsx_ok) cellGcm_rsx_process_fifo();
-        tm_fbdump_tick();
-        tm_ef_kick_tick();
-        tm_loaddone_tick();
-        tm_fifowatch_tick();
-        tm_memdump_tick();
-        const uint64_t now = tm_now_ms();
-        int fired = 0;
-        while ((int64_t)(now - next_tick) >= 0 && fired < 240) {
-            cellGcm_request_tick();
-            if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;
-            fired++;
-        }
-        if (fired >= 240) next_tick = now;
+        tm_walker_wait();
+        tm_walker_step(rsx_ok, false, &next_tick);
         if (rsx_ok) {
             if (be.pump() != 0) { rsx_ok = 0; continue; }
-            if (cellGcm_take_flip_pending_synced()) {
-                be.present();
-                tm_count_presented_frame();
-            }
+            tm_present_if_flipped(be, false);
         }
     }
     return nullptr;

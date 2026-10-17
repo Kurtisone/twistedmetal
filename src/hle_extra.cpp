@@ -1879,11 +1879,17 @@ static void probe_EventFlagWait(ppu_context* ctx)
  * GCM_SEMA_ACQUIRE=1 the walker can be waiting on a label this very thread
  * writes later. A walker that is busy elsewhere is not waited for.
  * ------------------------------------------------------------------------- */
+extern "C" void* cellGcm_fifo_kick_event(void);
+extern "C" int SetEvent(void* h);
+extern "C" int tm_flush_kick_on(void);
 void func_0077DEC0_lifted(ppu_context* ctx);
 void func_0077DEC0(ppu_context* ctx)
 {
     const uint32_t old_put = vm_read32(GCM_CONTROL_EA + 0);
     func_0077DEC0_lifted(ctx);
+    /* Wake the walker the moment put moves (boot_main.cpp, TM_FLUSH_KICK). */
+    if (tm_flush_kick_on() && vm_read32(GCM_CONTROL_EA + 0) != old_put)
+        SetEvent(cellGcm_fifo_kick_event());
     static int ms = -1;
     if (ms < 0) { const char* e = getenv("TM_FLUSH_SYNC_MS"); ms = e ? atoi(e) : 100; }
     if (ms <= 0) return;
