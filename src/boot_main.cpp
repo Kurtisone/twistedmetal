@@ -812,6 +812,29 @@ int main(int argc, char** argv)
     setvbuf(stdout, NULL, _IONBF, 0);   /* same: redirected stdout is block-buffered */
 #endif
 
+#if defined(TM_TITLE_BCES01010)
+    /* The image the menu shows comes back from the SPU post-FX, and each frame
+     * opens with an RSX semaphore acquire on the post-FX label (0x42). Unless
+     * the walker blocks there, it copies the image back before the jobs ran
+     * over it: the raw light accumulation, a saturated orange. The lifted jobs
+     * take about a second a frame, so the bound (ps3recomp's
+     * GCM_SEMA_ACQUIRE_MS) is generous; it only matters for a label nothing
+     * services, like the flip label during the load before the legal screens.
+     * Either variable set in the environment wins. */
+    {
+        static const char* const defaults[][2] = {
+            { "GCM_SEMA_ACQUIRE", "1" }, { "GCM_SEMA_ACQUIRE_MS", "5000" } };
+        for (const auto& d : defaults)
+            if (!getenv(d[0])) {
+#ifdef _WIN32
+                _putenv_s(d[0], d[1]);
+#else
+                setenv(d[0], d[1], 0);
+#endif
+            }
+    }
+#endif
+
     /* Flat VM: one host buffer, guest addr -> vm_base + addr. This maps the
      * FULL 32-bit guest space uniformly (page 0, the 0x60000000..0xD0000000
      * range, everything) -- which native-VA mapping can't on Windows, because

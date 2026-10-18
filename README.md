@@ -217,8 +217,9 @@ the post-FX tasks, `fix/spurs-job-stack-frame` for Sweet Tooth himself, and
 copies out. The menu's colours come from that SPU post-FX: the image it
 shows is copied back from main memory after the post-FX JobQueue jobs ran
 over it. Those jobs are 13 more binaries to dump and lift as above, and the
-RSX has to wait for the post-FX frame label: run with `GCM_SEMA_ACQUIRE=1
-GCM_SEMA_ACQUIRE_MS=5000` (200 ms is too short for the lifted jobs).
+RSX has to wait for the post-FX frame label: `boot_main` sets
+`GCM_SEMA_ACQUIRE=1 GCM_SEMA_ACQUIRE_MS=5000` for BCES01010 unless the
+environment does (200 ms is too short for the lifted jobs).
 Without the wait the copy takes the raw light accumulation in most frames,
 which is the saturated orange menu; with it the menu matched an RPCS3
 reference (natural light, the flames on Sweet Tooth's head) in 24 of 24
