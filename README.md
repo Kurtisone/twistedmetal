@@ -240,6 +240,21 @@ uses, `feat/vk-max-image-dim`. All of them are in its `linux/integration`
 branch. The legal screens present at two to three frames per second for
 now.
 
+On Linux a Challenge match (Sunsprings, six bots) now runs with its HUD, sky
+and level geometry. It takes six more JobQueue jobs, all in the EBOOT, so
+they can be carved by fingerprint instead of dumped:
+`6BA1F6CD43D6005F`, `A25123E89486EAD5`, `FD1877A6E25051E0`,
+`0C7C7294454D5F48` (the cull job), `3641D05246E29D20` and
+`56170BA0CB0F6E31`. The level streams its paged geometry (`suburbs.pgm`,
+inside `levels/suburbs.psarc`) through FIOS, which hands the Edge
+decompressor one 64 KB block per request and keeps a slice of it: no
+in-place buffer at +0x14, the slice's destination at +0x1C, its offset into
+the inflated block at +0x20 and its length at +0x24. FIOS polls the
+decompressor's `isDone` (0x00998638) instead of calling its wait, so the
+host inflate serves requests from both. Before that, the streamed records
+held stale UI data, the Edge geometry jobs asserted on them, filled their
+segment rings and the frame deadlocked behind the JobQueue sync.
+
 ## Project structure
 
 ```

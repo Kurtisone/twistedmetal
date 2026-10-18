@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <atomic>
 #include <mutex>
+#include <algorithm>
 #include <thread>
 #include <chrono>
 
@@ -1970,6 +1971,8 @@ void func_0077DEC0(ppu_context* ctx)
 #elif defined(TM_TITLE_BCES01010)
 #define TM_EDGE_WAIT        func_0099864C
 #define TM_EDGE_WAIT_LIFTED func_0099864C_lifted
+#define TM_EDGE_ISDONE        func_00998638
+#define TM_EDGE_ISDONE_LIFTED func_00998638_lifted
 #endif
 #ifdef TM_EDGE_WAIT
 /* ---------------------------------------------------------------------------
@@ -1991,6 +1994,9 @@ void func_0077DEC0(ppu_context* ctx)
 #define REQ_DSTLEN  0x18
 #define REQ_BUF     0x14
 #define REQ_DSTLEN2 0x24
+#define REQ_PART_DST 0x1C   /* no in-place buffer: copy a slice of the block here */
+#define REQ_PART_OFF 0x20   /* ...starting this far into the inflated block */
+#define REQ_PART_LEN 0x24   /* ...this many bytes */
 #define REQ_BUSY    0x28
 
 extern "C" int tm_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, uint32_t src_len);
@@ -2006,53 +2012,16 @@ extern "C" int tm_inflate_selftest(void);
 
 void TM_EDGE_WAIT_LIFTED(ppu_context* ctx);
 
-void TM_EDGE_WAIT(ppu_context* ctx)
+/* Inflate a queued request on the host and clear its busy flag. Returns 1 if
+ * it did. Both the completion wait and isDone() land here, from the main
+ * thread and from FIOS's, so serialize: the inflate is in place and a second
+ * pass over the same request would read its own output as the source. */
+static int tm_edge_service(uint32_t req)
 {
-    const uint32_t self = (uint32_t)ctx->gpr[3];
-    const uint32_t req  = (uint32_t)ctx->gpr[4];
-
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
-
-    { static long long dumped = 0;
-      if (getenv("TM_REQDUMP") && req && dumped++ < 4) {
-          fprintf(stderr, "[edge] request 0x%08X raw:' + B + 'n", req);
-          for (uint32_t o = 0; o < 0x40; o += 0x10)
-              fprintf(stderr, "    +%02X: %08X %08X %08X %08X' + B + 'n", o,
-                      vm_read32(req + o), vm_read32(req + o + 4),
-                      vm_read32(req + o + 8), vm_read32(req + o + 12));
-      } }
-
-    { static long long calls = 0;
-      if (getenv("TM_REQDUMP") && calls++ < 40)
-          fprintf(stderr, "[edge] enter #%lld req=0x%08X busy=%u dst=0x%08X src=0x%08X "
-                          "srclen=%u dstlen=%u/%u\n", calls, req,
-                  req ? vm_read32(req + REQ_BUSY) : 0,
-                  req ? vm_read32(req + REQ_DST) : 0,
-                  req ? vm_read32(req + REQ_SRC) : 0,
-                  req ? vm_read32(req + REQ_SRCLEN) : 0,
-                  req ? vm_read32(req + REQ_DSTLEN) : 0,
-                  req ? vm_read32(req + REQ_DSTLEN2) : 0); }
-
-    if (req && getenv("TM_SPU_KICK")) {
-        const char* ms = getenv("TM_SPU_KICK_MS");
-        const int spins = (ms ? atoi(ms) : 200) / 5;
-        /* Signalling a taskset with nothing parked is a no-op, so poke them all
-         * rather than guess which one owns the Edge task. */
-        for (int i = 0; i < g_ntasksets; i++)
-            for (uint32_t t = 0; t < 4; t++)
-                spu_taskset_signal_task(g_tasksets[i], t);
-        for (int i = 0; i < spins && vm_read32(req + REQ_BUSY); i++)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (!vm_read32(req + REQ_BUSY)) {
-            static int said = 0;
-            if (said++ < 4) fprintf(stderr, "[edge] SPU task serviced request 0x%08X\n", req);
-            ctx->gpr[3] = 0;
-            return;
-        }
-    }
-
-    if (on && req) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    if (!req || !vm_read32(req + REQ_BUSY)) return 0;
+    {
         const uint32_t dst    = vm_read32(req + REQ_DST);
         const uint32_t src    = vm_read32(req + REQ_SRC);
         const uint32_t srclen = vm_read32(req + REQ_SRCLEN);
@@ -2095,9 +2064,19 @@ void TM_EDGE_WAIT(ppu_context* ctx)
               if (ghi && n > 0 && d0 < ghi && d0 + (uint32_t)n > glo)
                   fprintf(stderr, "[guard] edge inflate req=0x%08X writes 0x%08X..0x%08X (%d bytes, inplace=%d dstlen=%u)\n",
                           req, d0, d0 + (uint32_t)n, n, inplace ? 1 : 0, dstlen); }
+            /* A request with no in-place buffer wants a slice of the block:
+             * FIOS streaming an archive member (suburbs.pgm) asks for one 64K
+             * block per request and keeps only [+0x20, +0x20 + +0x24), copied
+             * to +0x1C. +0x00 is then a fixed scratch address in the title's
+             * data, not the destination -- writing the whole block there
+             * clobbered it and left the streamed geometry unloaded. */
+            const uint32_t pdst = inplace ? 0 : vm_read32(req + REQ_PART_DST);
+            const uint32_t poff = vm_read32(req + REQ_PART_OFF);
+            const uint32_t plen = vm_read32(req + REQ_PART_LEN);
             if (n >= 0) {
-                if (inplace) memcpy(vm_base + inplace, tmp, (size_t)n);
-                else         memcpy(vm_base + dst,     tmp, (size_t)n);
+                if (inplace)     memcpy(vm_base + inplace, tmp, (size_t)n);
+                else if (pdst) { if (poff < (uint32_t)n) memcpy(vm_base + pdst, tmp + poff, std::min<size_t>(plen, (size_t)n - poff)); }
+                else             memcpy(vm_base + dst,     tmp, (size_t)n);
             }
             free(tmp);
             static long long done = 0;
@@ -2148,8 +2127,7 @@ void TM_EDGE_WAIT(ppu_context* ctx)
                 /* Fall through to the lifted body rather than returning: with the
                  * busy flag already clear it skips the event-flag wait but still
                  * runs the post-processing after it, which the caller depends on. */
-                TM_EDGE_WAIT_LIFTED(ctx);
-                return;
+                return 1;
             }
             static int warned = 0;
             if (warned++ < 4)
@@ -2158,9 +2136,77 @@ void TM_EDGE_WAIT(ppu_context* ctx)
                         req, src, srclen, dst, dstlen);
         }
     }
+    return 0;
+}
+
+void TM_EDGE_WAIT(ppu_context* ctx)
+{
+    const uint32_t self = (uint32_t)ctx->gpr[3];
+    const uint32_t req  = (uint32_t)ctx->gpr[4];
+
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
+
+    { static long long dumped = 0;
+      if (getenv("TM_REQDUMP") && req && dumped++ < 4) {
+          fprintf(stderr, "[edge] request 0x%08X raw:' + B + 'n", req);
+          for (uint32_t o = 0; o < 0x40; o += 0x10)
+              fprintf(stderr, "    +%02X: %08X %08X %08X %08X' + B + 'n", o,
+                      vm_read32(req + o), vm_read32(req + o + 4),
+                      vm_read32(req + o + 8), vm_read32(req + o + 12));
+      } }
+
+    { static long long calls = 0;
+      if (getenv("TM_REQDUMP") && calls++ < 40)
+          fprintf(stderr, "[edge] enter #%lld req=0x%08X busy=%u dst=0x%08X src=0x%08X "
+                          "srclen=%u dstlen=%u/%u\n", calls, req,
+                  req ? vm_read32(req + REQ_BUSY) : 0,
+                  req ? vm_read32(req + REQ_DST) : 0,
+                  req ? vm_read32(req + REQ_SRC) : 0,
+                  req ? vm_read32(req + REQ_SRCLEN) : 0,
+                  req ? vm_read32(req + REQ_DSTLEN) : 0,
+                  req ? vm_read32(req + REQ_DSTLEN2) : 0); }
+
+    if (req && getenv("TM_SPU_KICK")) {
+        const char* ms = getenv("TM_SPU_KICK_MS");
+        const int spins = (ms ? atoi(ms) : 200) / 5;
+        /* Signalling a taskset with nothing parked is a no-op, so poke them all
+         * rather than guess which one owns the Edge task. */
+        for (int i = 0; i < g_ntasksets; i++)
+            for (uint32_t t = 0; t < 4; t++)
+                spu_taskset_signal_task(g_tasksets[i], t);
+        for (int i = 0; i < spins && vm_read32(req + REQ_BUSY); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!vm_read32(req + REQ_BUSY)) {
+            static int said = 0;
+            if (said++ < 4) fprintf(stderr, "[edge] SPU task serviced request 0x%08X\n", req);
+            ctx->gpr[3] = 0;
+            return;
+        }
+    }
+
+    if (on && req && tm_edge_service(req)) {
+        TM_EDGE_WAIT_LIFTED(ctx);
+        return;
+    }
     (void)self;
     TM_EDGE_WAIT_LIFTED(ctx);
 }
+
+/* isDone(this, request), BCES01010 0x00998638: returns busy == 0. FIOS's
+ * archive reader polls it instead of calling the wait, so a request it
+ * queued was never inflated: its streamed geometry (suburbs.pgm) stayed
+ * whatever the buffer held before. Service the request here too. */
+#ifdef TM_EDGE_ISDONE
+void TM_EDGE_ISDONE_LIFTED(ppu_context* ctx);
+void TM_EDGE_ISDONE(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
+    if (on) tm_edge_service((uint32_t)ctx->gpr[4]);
+    TM_EDGE_ISDONE_LIFTED(ctx);
+}
+#endif
 #endif /* TM_EDGE_WAIT */
 
 /* BCUS98106 by-address hooks: heap, pool. Meaningless on another binary,
