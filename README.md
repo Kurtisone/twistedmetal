@@ -163,7 +163,7 @@ python $P/build_spu_workloads.py --images meta/spu --lifted src/spu_gen \
        --out src/gen/spu_workloads.c --register-fn tm_spu_register_all \
        --constructor --title twistedmetal
 cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DTM_TITLE=BCES01010 \
-      -DTM_RECOMP_COMPILE_OPTIONS=-O1
+      -DTM_RECOMP_COMPILE_OPTIONS=-O1 -DCMAKE_C_FLAGS=-march=x86-64-v3
 cmake --build build-linux -j2
 PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EBOOT.ELF
 ```
@@ -185,6 +185,11 @@ python $P/spu_lifter.py meta/spu/${kind}_$fp.elf --auto-functions meta/spu/${kin
 cmake build-linux && cmake --build build-linux -j2
 ```
 
+- `-march=x86-64-v3` (AVX2, FMA) is for the C side, the runtime and the
+  lifted SPU jobs: it enables the runtime's SSE4.1 shuffles and, with
+  ps3recomp's `perf/spu-float-avx2`, four SPU float lanes at a time. The
+  menu's post-FX jobs then run at about 2.5 frames per second instead of
+  0.9. Leave it out for a CPU without AVX2.
 - GCC needs about 2 GB per 240k-line chunk at `-O1`. `--chunk-lines`
   (ps3recomp's `ppu_lifter.py`) keeps each chunk small enough for a 16 GB
   machine; without it, chunks are 600k lines.
