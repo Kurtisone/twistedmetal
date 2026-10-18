@@ -254,6 +254,11 @@ decompressor's `isDone` (0x00998638) instead of calling its wait, so the
 host inflate serves requests from both. Before that, the streamed records
 held stale UI data, the Edge geometry jobs asserted on them, filled their
 segment rings and the frame deadlocked behind the JobQueue sync.
+Lift the PPU with ps3recomp at a470b79 or later: an older lifter turned a
+mid-function spill reload of r16 (`ld r16,0x100(r1)` at 0x0068A224) into
+the register's value at entry, and about a minute into the match the
+category insert `func_00683E6C` walked a NULL list and spun forever. With
+a current lift the match has run for ten minutes.
 
 ## Project structure
 

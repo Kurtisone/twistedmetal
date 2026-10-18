@@ -36,7 +36,6 @@
 
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
-uint32_t vm_read32(uint64_t a);
 void     vm_write32(uint64_t a, uint32_t v);
 uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
@@ -258,7 +257,6 @@ static void sys_lwcond_create(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 extern "C" int32_t cellSpursCreateTaskset(void* spurs, void* taskset, uint64_t args,
                                           const void* priority, uint32_t maxContention);
-extern "C" uint64_t vm_read64(uint64_t a);
 
 /* CellSpursTasksetAttribute2, 512 bytes:
  *   +0x00 revision  +0x04 name  +0x08 args  +0x10 priority[8]
