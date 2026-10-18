@@ -111,6 +111,10 @@ static void probe_EventFlagWait(ppu_context* ctx);
 static void tm_jq_push_job(ppu_context* ctx);
 extern "C" ppu_context* g_tm_postfx_ctx;   /* TEMP: SpuPostFX thread (generated code) */
 #pragma comment(linker, "/alternatename:g_tm_postfx_ctx=?g_tm_postfx_ctx@@3PEAUppu_context@@EA")
+static void tm_jq_push_job_list(ppu_context* ctx);
+static void tm_jq_port_push(ppu_context* ctx);
+static void tm_jq_port_sync(ppu_context* ctx);
+static void tm_jq_port_try_sync(ppu_context* ctx);
 static void tm_jq_sync(ppu_context* ctx);
 
 extern "C" void tm_vdec_register(void);   /* src/vdec_hle.cpp */
@@ -188,6 +192,10 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
     ps3_hle_register_ctx(0x90E392CFu, "cellSpursJq push job", tm_jq_push_job);
     ps3_hle_register_ctx(0x9396BE1Du, "cellSpursJq sync", tm_jq_sync);
+    ps3_hle_register_ctx(0x4E1A17A6u, "cellSpursJq port push", tm_jq_port_push);
+    ps3_hle_register_ctx(0x1B6EEA7Eu, "cellSpursJq push job list", tm_jq_push_job_list);
+    ps3_hle_register_ctx(0x634B1502u, "cellSpursJobQueuePortSync", tm_jq_port_sync);
+    ps3_hle_register_ctx(0x80A0264Cu, "cellSpursJobQueuePortTrySync", tm_jq_port_try_sync);
     /* The post-FX library init creates its taskset, a barrier for its six
      * tasks and the tasks themselves, then reads the taskset's workload id
      * back. Neither call is in the generated table. */
@@ -2391,11 +2399,12 @@ void tm_seg_probe(ppu_context* ctx)
 #endif
 extern "C" int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                                          uint32_t job_ea, uint32_t job_desc_size);
-struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; };
+struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; bool sync; };
 static std::mutex s_jq_mx;
 static std::condition_variable s_jq_cv, s_jq_done;
 static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
+static std::map<uint32_t, int> s_jq_running;      /* jq -> jobs a worker is running */
 extern "C" void spurs_job_set_spu_num(uint32_t n);
 TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
@@ -2403,17 +2412,23 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
     for (;;) {
         TmJqItem it;
         { std::unique_lock<std::mutex> lk(s_jq_mx);
-          s_jq_cv.wait(lk, [] { return !s_jq_q.empty(); });
-          it = s_jq_q.front(); s_jq_q.pop_front(); }
+          /* A sync job starts once every job pushed before it on its queue
+           * has finished: the queue is FIFO, so those are the ones running. */
+          s_jq_cv.wait(lk, [] {
+              return !s_jq_q.empty() && (!s_jq_q.front().sync || s_jq_running[s_jq_q.front().jq] == 0); });
+          it = s_jq_q.front(); s_jq_q.pop_front();
+          ++s_jq_running[it.jq]; }
         int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
         if (it.bin == 0x00E3BD80u) { static int k = 0; if (k++ < 6) {  /* TEMP: the cull job */
             fprintf(stderr, "[jq-cull] job=0x%08X ran=%d counter=0x%08X\n", it.job, ran, vm_read32(0x019307D0u)); } }
         { std::lock_guard<std::mutex> lk(s_jq_mx);
-          --s_jq_pending[((uint64_t)it.jq << 32) | it.tag]; }
+          --s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
+          --s_jq_running[it.jq]; }
         s_jq_done.notify_all();
+        s_jq_cv.notify_all();      /* a sync job may have been waiting on this one */
     }
 }
-static void tm_jq_push_job(ppu_context* ctx)
+static void tm_jq_push(ppu_context* ctx, bool sync)
 {
     static std::once_flag once;
     std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
@@ -2439,11 +2454,40 @@ static void tm_jq_push_job(ppu_context* ctx)
     it.tag = (uint32_t)ctx->gpr[6] & 15;
     it.bin = (uint32_t)(vm_read64(it.job + 0) & ~1ull);
     it.bin_size = (uint32_t)vm_read16(it.job + 8) << 4;
+    it.sync = sync;
     if (it.bin && it.bin_size) {
         { std::lock_guard<std::mutex> lk(s_jq_mx);
           ++s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           s_jq_q.push_back(it); }
         s_jq_cv.notify_one();
+    }
+    ctx->gpr[3] = 0;
+}
+static void tm_jq_push_job(ppu_context* ctx) { tm_jq_push(ctx, false); }
+/* _cellSpursJobQueuePortPushBody: the arguments read as PortPushJobBody2's
+ * (port, job, sizeDesc, tag), then isSync in r7. Twisted Metal passes 1 in
+ * both r6 and r7. */
+static void tm_jq_port_push(ppu_context* ctx) { tm_jq_push(ctx, ctx->gpr[7] != 0); }
+/* _cellSpursJobQueuePortPushJobListBody(port, CellSpursJobList* list, ?, tag,
+ * isSync): a CellSpursJobList is { u32 numJobs; u32 sizeOfJob; u64 eaJobList },
+ * numJobs descriptors of sizeOfJob bytes laid end to end. Each goes through the
+ * single-job push, keyed on the same port and tag, so the port's sync waits for
+ * all of them. Twisted Metal's post-FX (SpuPostFX.cpp) pushes its passes this
+ * way, lists of 16 to 64 jobs over the image, the bloom and the depth copied
+ * out to main memory; unhandled, the call faked CELL_OK and none of them ran. */
+static void tm_jq_push_job_list(ppu_context* ctx)
+{
+    const uint32_t list = (uint32_t)ctx->gpr[4];
+    const uint32_t n = vm_read32(list + 0), stride = vm_read32(list + 4);
+    const uint32_t first = (uint32_t)vm_read64(list + 8);
+    const uint64_t port = ctx->gpr[3], tag = ctx->gpr[6];
+    const bool sync = ctx->gpr[7] != 0;
+    for (uint32_t i = 0; i < n && stride; i++) {
+        ctx->gpr[3] = port;
+        ctx->gpr[4] = first + i * stride;
+        ctx->gpr[5] = stride;
+        ctx->gpr[6] = tag;
+        tm_jq_push(ctx, sync && i == 0);   /* the list waits as a whole, its jobs run side by side */
     }
     ctx->gpr[3] = 0;
 }
@@ -2458,4 +2502,30 @@ static void tm_jq_sync(ppu_context* ctx)
         return true;
     });
     ctx->gpr[3] = 0;
+}
+/* cellSpursJobQueuePortSync(port) waits for every job pushed through the
+ * port, whatever its tag; PortTrySync(port) answers without waiting. Twisted
+ * Metal polls TrySync (sleeping while the answer is non-zero), then calls
+ * PortSync. Both were unregistered and faked CELL_OK, so the title never
+ * waited for its jobs. */
+static bool tm_jq_port_idle(uint64_t port)
+{
+    for (uint32_t t = 0; t < 16; t++)
+        if (s_jq_pending[(port << 32) | t] > 0) return false;
+    return true;
+}
+static void tm_jq_port_sync(ppu_context* ctx)
+{
+    const uint64_t port = (uint32_t)ctx->gpr[3];
+    std::unique_lock<std::mutex> lk(s_jq_mx);
+    s_jq_done.wait(lk, [&] { return tm_jq_port_idle(port); });
+    ctx->gpr[3] = 0;
+}
+static void tm_jq_port_try_sync(ppu_context* ctx)
+{
+    const uint64_t port = (uint32_t)ctx->gpr[3];
+    std::lock_guard<std::mutex> lk(s_jq_mx);
+    /* CELL_SPURS_JQ_ERROR_BUSY as ps3recomp's cellSpursJq.h names it; the
+     * title only tests for non-zero. */
+    ctx->gpr[3] = tm_jq_port_idle(port) ? 0 : 0x80410A05u;
 }
