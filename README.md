@@ -208,17 +208,21 @@ items and button hints render ("ONE PLAYER", "MULTI-PLAYER", "QUICK ONLINE
 ACTION", "OPTIONS", "PREV/NEXT", "SELECT"); that needs ps3recomp's
 `fix/gcm-resolve-main-io`, without which the menu's fragment programs were
 read out of VRAM. The deferred 3D scene behind the menu (shadow atlas,
-four-target G-buffer, HDR lighting, bloom) now draws its geometry too, with
-wrong colours so far. That took three more ps3recomp fixes: its SPU decoder
-lacked `orbi`/`xorhi`/`xorbi` (`fix/spu-disasm-orbi`; re-lift the jobs and
-images after it -- job 0x29F5F1C692D71C34 runs four `orbi` every menu
-frame), and the post-FX tasks need `cellSpursBarrierInitialize` and
-`cellSpursGetTasksetInfo` (`feat/spurs-barrier-tasksetinfo`) plus a taskset
-the runtime no longer corrupts (`fix/spurs-taskset-native-fields`). With
-them `SpuPostFX` runs its tasks again and again (one post-FX frame about
-every 20 s so far); the RSX still runs ahead of its frame label
-(`GCM_SEMA_ACQUIRE=1` makes it wait, and then the title stalls after its
-legal screens). Until ps3recomp's `fix/lwmutex-posix`, every `sys_lwmutex`
+four-target G-buffer, HDR lighting, bloom) draws too. That took ps3recomp's
+`fix/spu-disasm-orbi` (re-lift the jobs and images after it -- job
+0x29F5F1C692D71C34 runs four `orbi` every menu frame),
+`feat/spurs-barrier-tasksetinfo` and `fix/spurs-taskset-native-fields` for
+the post-FX tasks, `fix/spurs-job-stack-frame` for Sweet Tooth himself, and
+`fix/engine-fp16-transfer-read` for the bloom and the flames the post-FX
+copies out. The menu's colours come from that SPU post-FX: the image it
+shows is copied back from main memory after the post-FX JobQueue jobs ran
+over it. Those jobs are 13 more binaries to dump and lift as above, and the
+RSX has to wait for the post-FX frame label: run with `GCM_SEMA_ACQUIRE=1
+GCM_SEMA_ACQUIRE_MS=5000` (200 ms is too short for the lifted jobs).
+Without the wait the copy takes the raw light accumulation in most frames,
+which is the saturated orange menu; with it the menu matched an RPCS3
+reference (natural light, the flames on Sweet Tooth's head) in 24 of 24
+late frames over 3 runs. Until ps3recomp's `fix/lwmutex-posix`, every `sys_lwmutex`
 was a no-op on POSIX, and about one run in three aborted in the guest
 allocator (`TM_FREECHECK=1` shows such a double free). On Vulkan (RADV,
 Steam Deck) the loading indicator, the boot logo, the legal screens and
